@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+!.env.example
+*_cache.json
+.moodle_session.json
