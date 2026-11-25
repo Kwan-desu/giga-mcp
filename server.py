@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -33,31 +34,45 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP
 
 # ---------------------------------------------------------------------------
-# Paths (overridable via environment variables)
+# Paths (overridable via environment variables; supports bundled or sibling layout)
 # ---------------------------------------------------------------------------
-COOL_STUFF_DIR = Path(__file__).resolve().parent.parent
+BASE_DIR = Path(__file__).resolve().parent
+COOL_STUFF_DIR = BASE_DIR.parent
 AI_PROJECT_DIR = COOL_STUFF_DIR.parent
 
-TEAMS_SERVER_PATH = Path(
-    os.environ.get(
-        "GIGA_TEAMS_SERVER",
-        str(COOL_STUFF_DIR / "teams-mcp" / "windows" / "server.py"),
-    )
-).resolve()
 
-APTIMETABLE_SERVER_PATH = Path(
-    os.environ.get(
-        "GIGA_APTIMETABLE_SERVER",
-        str(COOL_STUFF_DIR / "aptimetable-mcp" / "server.py"),
-    )
-).resolve()
+def _resolve_path(env_var: str, bundled: Path, sibling: Path) -> Path:
+    override = os.environ.get(env_var)
+    if override:
+        return Path(override).resolve()
+    if bundled.exists():
+        return bundled.resolve()
+    return sibling.resolve()
 
-MOODLE_ROOT_DIR = Path(
-    os.environ.get(
-        "GIGA_MOODLE_DIR",
-        str(AI_PROJECT_DIR / "Moodle-MCP"),
-    )
-).resolve()
+
+TEAMS_SERVER_PATH = _resolve_path(
+    "GIGA_TEAMS_SERVER",
+    BASE_DIR / "teams-mcp" / "windows" / "server.py",
+    COOL_STUFF_DIR / "teams-mcp" / "windows" / "server.py",
+)
+
+APTIMETABLE_SERVER_PATH = _resolve_path(
+    "GIGA_APTIMETABLE_SERVER",
+    BASE_DIR / "aptimetable-mcp" / "server.py",
+    COOL_STUFF_DIR / "aptimetable-mcp" / "server.py",
+)
+
+MOODLE_ROOT_DIR = _resolve_path(
+    "GIGA_MOODLE_DIR",
+    BASE_DIR / "Moodle-MCP",
+    AI_PROJECT_DIR / "Moodle-MCP",
+)
+
+# Share the persistent Chromium SSO profile between Teams and Moodle unless overridden
+os.environ.setdefault(
+    "MOODLE_BROWSER_PROFILE_DIR",
+    str((TEAMS_SERVER_PATH.parent / "teams_browser_profile").resolve()),
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -146,6 +161,61 @@ mcp = FastMCP(
 _mount_tools(mcp, teams_mod.mcp, "teams-mcp")
 _mount_tools(mcp, timetable_mod.mcp, "aptimetable-mcp")
 _mount_tools(mcp, moodle_mod.mcp, "moodle-mcp")
+
+
+@mcp.tool()
+async def auth_status(refresh_teams: bool = False) -> str:
+    """Report whether Moodle and Microsoft Teams authentication tokens/sessions are valid or expired.
+
+    Args:
+        refresh_teams: Set to True to attempt a Teams token refresh before reporting status.
+    """
+    # Check Moodle session
+    try:
+        moodle_res = moodle_mod.client.check_auth()
+        moodle_valid = bool(moodle_res.get("authenticated"))
+        moodle_status = {
+            "valid": moodle_valid,
+            "status": "valid" if moodle_valid else "expired",
+            **moodle_res,
+        }
+    except Exception as exc:
+        moodle_valid = False
+        moodle_status = {
+            "valid": False,
+            "status": "error",
+            "error": str(exc),
+        }
+
+    # Check Teams token
+    try:
+        tm = teams_mod.token_manager
+        if refresh_teams:
+            await tm.ensure_valid_token(force=True)
+        teams_raw = tm.status_dict()
+        teams_valid = bool(teams_raw.get("authenticated"))
+        teams_status = {
+            "valid": teams_valid,
+            "status": "valid" if teams_valid else "expired",
+            **teams_raw,
+        }
+    except Exception as exc:
+        teams_valid = False
+        teams_status = {
+            "valid": False,
+            "status": "error",
+            "error": str(exc),
+        }
+
+    return json.dumps(
+        {
+            "all_valid": moodle_valid and teams_valid,
+            "moodle": moodle_status,
+            "teams": teams_status,
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
 
 
 def main() -> None:
